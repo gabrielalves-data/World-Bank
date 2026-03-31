@@ -3,23 +3,43 @@ import json
 import logging
 import os
 from datetime import date
-from config_loader import load_config
-
-# Logging Setup
-def setup_logging(config: dict) -> logging.Logger:
-    logging.basicConfig(
-        level=config["logging"]["level"],
-        format=config["logging"]["format"]
-    )
-
-    return logging.getLogger(__name__)
+from utils.config_loader import load_config
+from utils.logging_config import setup_logging
 
 # API Call (single page)
 def fetch_page(base_url: str, indicator: str, page: int, per_page: int, fmt: str) -> tuple:
     """
-    Fetch one page from the World Bank API.
-    Returns (metadata_dict, records_list).
-    Raises an exception if the request fails.
+    Fetch a single page of data from the World Bank API.
+
+    Parameters
+    ----------
+    base_url : str
+        Base URL of the World Bank API.
+    indicator : str
+        Indicator code (e.g., GDP indicator).
+    page : int
+        Page number to retrieve.
+    per_page : int
+        Number of records per page.
+    fmt : str
+        Response format (e.g., "json").
+
+    Returns
+    -------
+    tuple
+        A tuple containing:
+        - metadata : dict
+        - records : list
+
+    Raises
+    ------
+    requests.HTTPError
+        If the API request fails.
+
+    Notes
+    -----
+    The API returns a two-element list:
+    [metadata, records]
     """
     url = f"{base_url}/country/all/indicator/{indicator}"
     params = {
@@ -42,7 +62,26 @@ def fetch_page(base_url: str, indicator: str, page: int, per_page: int, fmt: str
 # API Call Paginated Fetch (all pages)
 def fetch_all_records(config: dict, logger: logging.Logger) -> list:
     """
-    Iterate over every page of the API and return a flat list of all records.
+    Retrieve all records from the World Bank API using pagination.
+
+    Parameters
+    ----------
+    config : dict
+        Configuration dictionary containing API settings.
+    logger : logging.Logger
+        Logger instance for logging progress.
+
+    Returns
+    -------
+    list
+        List of all records retrieved from the API.
+
+    Notes
+    -----
+    This function:
+    - Fetches the first page to determine total pages
+    - Iterates through remaining pages
+    - Aggregates results into a single list
     """
     base_url = config["api"]["base_url"]
     indicator = config["api"]["indicator"]
@@ -73,8 +112,24 @@ def fetch_all_records(config: dict, logger: logging.Logger) -> list:
 # Save JSON Locally
 def save_raw_json(records: list, logger: logging.Logger) -> str:
     """
-    Save the raw records to logs/ with today's date in the filename.
-    Returns the local file path so then it can be used in s3_upload.
+    Save raw API records to a local JSON file.
+
+    Parameters
+    ----------
+    records : list
+        List of records to save.
+    logger : logging.Logger
+        Logger instance for logging progress.
+
+    Returns
+    -------
+    str
+        File path of the saved JSON file.
+
+    Notes
+    -----
+    The file is saved in the 'logs/' directory with the format:
+    raw_YYYY-MM-DD.json
     """
     today = date.today().strftime("%Y-%m-%d")
     filename = f"raw_{today}.json"
@@ -93,9 +148,26 @@ def save_raw_json(records: list, logger: logging.Logger) -> str:
 # Main Entrypoint
 def run_extract() -> str:
     """
-    Full extraction flow. Called directly or by Airflow.
-    Returns the local path of the saved JSON file.
+    Execute the full data extraction pipeline.
+
+    Returns
+    -------
+    str
+        Path to the saved raw JSON file.
+
+    Notes
+    -----
+    This function:
+    - Loads configuration
+    - Sets up logging
+    - Fetches all API records
+    - Saves results locally
+
+    Designed to be used as:
+    - A standalone script
+    - A callable function in orchestration tools (e.g., Airflow)
     """
+    
     config = load_config()
     logger = setup_logging(config)
 
