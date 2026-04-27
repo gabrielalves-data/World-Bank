@@ -89,7 +89,7 @@ def upload_to_s3(local_path: str, s3_key: str, bucket_name: str, logger: logging
         )
 
         logger.info(f"Upload successful")
-        logger.info(f"S3 URL: {f"s3://{bucket_name}/{s3_key}"}")
+        logger.info(f'S3 URL: {f"s3://{bucket_name}/{s3_key}"}')
 
         return True
     

@@ -12,7 +12,7 @@ from utils.logging_config import setup_logging
 from scripts.s3_upload import get_s3_path
 
 
-class WorlBankSparkJob:
+class WorldBankSparkJob:
     """PySpark job for processing World Bank GDP data."""
 
     def __init__(self, config_path: str = None):
@@ -253,7 +253,7 @@ class WorlBankSparkJob:
 def main():
     """Main entry point for the Spark job."""
     try:
-        job = WorlBankSparkJob()
+        job = WorldBankSparkJob()
         job.run()
         sys.exit(0)
 
