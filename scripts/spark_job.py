@@ -6,6 +6,7 @@ import yaml
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql.functions import col, avg, count
 from pyspark.sql.types import IntegerType, DoubleType
+from datetime import datetime
 
 from utils.config_loader import load_config
 from utils.logging_config import setup_logging
@@ -54,8 +55,15 @@ class WorldBankSparkJob:
                     .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
                     .config("spark.hadoop.fs.s3a.aws.credentials.provider", 
                            "com.amazonaws.auth.DefaultAWSCredentialsProviderChain")
+                    .config("spark.jars.packages", "org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.565")
                     .config("spark.sql.adaptive.enabled", "true")
                     .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
+                    .config("spark.hadoop.fs.s3a.multipart.size", "67108864")
+                    .config("spark.hadoop.fs.s3a.fast.upload", "true")
+                    .config("spark.hadoop.fs.s3a.fast.upload.buffer", "bytebuffer")
+                    .config("spark.driver.memory", "2g")
+                    .config("spark.executor.memory", "2g")
+                    .config("spark.driver.maxResultSize", "1g")
                     .getOrCreate())
             
             self.logger.info("SparkSession created successfully")
@@ -143,13 +151,14 @@ class WorldBankSparkJob:
         Args:
             df: Cleaned DataFrame
         """
-        processed_path = get_s3_path(self.config, 'processed')
+        date_partition = datetime.now().strftime("%Y/%m/%d")
+        processed_path = get_s3_path(self.config, 'processed', date_partition=date_partition)
         processed_path = self.convert_to_s3a(processed_path)
 
         try:
             self.logger.info(f"Writing processed data to: {processed_path}")
 
-            df.write.mode('overwrite').partitionBy('year').parquet(processed_path)
+            df.write.mode('overwrite').parquet(processed_path)
 
             self.logger.info(f"Successfully wrote processed data (partitioned by year)")
 
@@ -178,6 +187,8 @@ class WorldBankSparkJob:
                                 )
                                 .orderBy(col('avg_gdp_usd').desc()))
             
+            analytics_df.cache()
+            
             row_count = analytics_df.count()
             self.logger.info("Analytics aggregation complete:")
             self.logger.info(f"  - Countries analyzed: {row_count:,}")
@@ -200,7 +211,8 @@ class WorldBankSparkJob:
         Args:
             df: Analytics DataFrame
         """
-        analytics_path = get_s3_path(self.config, 'analytics', 'avg_gdp')
+        date_partition = datetime.now().strftime("%Y/%m/%d")
+        analytics_path = get_s3_path(self.config, 'analytics', date_partition=date_partition)
         analytics_path = self.convert_to_s3a(analytics_path)
 
         try:
@@ -228,6 +240,8 @@ class WorldBankSparkJob:
             # Step 2: Clean raw data
             cleaned_df = self.clean_data(raw_df)
 
+            cleaned_df.cache()
+
             # Step 3: Write processed/cleaned data
             self.write_processed_data(cleaned_df)
 
@@ -236,6 +250,9 @@ class WorldBankSparkJob:
 
             # Step 5: Write analytics data
             self.write_analytics_data(analytics_df)
+
+            cleaned_df.unpersist()
+            analytics_df.unpersist()
 
             self.logger.info("="*80)
             self.logger.info("Pipeline completed successfully")
