@@ -2,7 +2,7 @@ import sys
 
 from scripts.extract import run_extract
 from scripts.s3_upload import upload_raw_data
-from scripts.pyspark import WorldBankSparkJob
+from scripts.spark_job import WorldBankSparkJob
 from utils.config_loader import load_config
 from utils.logging_config import setup_logging
 

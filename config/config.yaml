@@ -1,5 +1,5 @@
 s3:
-  bucket: "worldbank-pipeline-gabriel"
+  bucket: ${S3_BUCKET_NAME}
   raw_prefix: "raw/world_bank"
   processed_prefix: "processed/world_bank"
   analytics_prefix: "analytics/world_bank"
