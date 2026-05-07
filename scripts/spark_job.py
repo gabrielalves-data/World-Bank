@@ -7,6 +7,7 @@ from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql.functions import col, avg, count
 from pyspark.sql.types import IntegerType, DoubleType
 from datetime import datetime
+import psycopg2
 
 from utils.config_loader import load_config
 from utils.logging_config import setup_logging
@@ -40,6 +41,32 @@ class WorldBankSparkJob:
             S3 path with s3a:// protocol
         """
         return s3_path.replace("s3://", "s3a://")
+
+    def _postgres_url(self) -> str:
+        pg = self.config["postgres"]
+
+        return f"jdbc:postgresql://{pg['host']}:{pg.get('port', 5432)}/{pg['database']}"
+    
+
+    def _postgres_props(self) -> dict:
+        pg = self.config["postgres"]
+
+        return {
+            "user": pg["user"],
+            "password": pg["password"],
+            "driver": "org.postgresql.Driver"
+        }
+    
+    def _get_pg_connection(self):
+        """Return a psycopg2 connection using config values."""
+        pg = self.config["postgres"]
+        return psycopg2.connect(
+            host=pg["host"],
+            port=pg.get("port", 5432),
+            dbname=pg["database"],
+            user=pg["user"],
+            password=pg["password"]
+        )
     
 
     def create_spark_session(self) -> SparkSession:
@@ -53,9 +80,12 @@ class WorldBankSparkJob:
             spark = (SparkSession.builder
                     .appName('WorldBankPipeline')
                     .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
-                    .config("spark.hadoop.fs.s3a.aws.credentials.provider", 
-                           "com.amazonaws.auth.DefaultAWSCredentialsProviderChain")
-                    .config("spark.jars.packages", "org.apache.hadoop:hadoop-aws:3.3.4,com.amazonaws:aws-java-sdk-bundle:1.12.565")
+                    .config("spark.hadoop.fs.s3a.aws.credentials.provider",
+                        "com.amazonaws.auth.DefaultAWSCredentialsProviderChain")
+                    .config("spark.driver.extraClassPath",
+                        "/opt/spark-3.5.0-bin-hadoop3/jars/postgresql-42.7.1.jar")
+                    .config("spark.executor.extraClassPath",
+                        "/opt/spark-3.5.0-bin-hadoop3/jars/postgresql-42.7.1.jar")
                     .config("spark.sql.adaptive.enabled", "true")
                     .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
                     .config("spark.hadoop.fs.s3a.multipart.size", "67108864")
@@ -227,6 +257,85 @@ class WorldBankSparkJob:
             raise
 
 
+
+    def write_to_staging(self, df: DataFrame) -> None:
+        """
+        Truncate stg_gdp and bulk-load the cleaned DataFrame into it via JDBC.
+ 
+        The staging table mirrors the cleaned DataFrame schema:
+            country_name, country_iso3, indicator_id, year, gdp_usd
+ 
+        Parameters
+        ----------
+        df : DataFrame
+            Cleaned DataFrame produced by clean_data().
+        """
+        try:
+            # Truncate before load so a re-run never leaves stale data
+            self.logger.info("Truncating stg_gdp...")
+            conn = self._get_pg_connection()
+            cursor = conn.cursor()
+            cursor.execute("TRUNCATE TABLE stg_gdp;")
+            conn.commit()
+            cursor.close()
+            conn.close()
+            self.logger.info("stg_gdp truncated successfully")
+
+            row_count = df.count()
+            self.logger.info(f"Writing {row_count:,} rows to stg_gdp...")
+
+            url = self._postgres_url()
+            props = {
+                "user": self.config["postgres"]["user"],
+                "password": self.config["postgres"]["password"],
+                "driver": "org.postgresql.Driver"
+            }
+
+            # Bulk insert via JDBC
+            df.write.mode("append").option("batchsize", "5000").jdbc(url=url, table="stg_gdp", properties=props)
+            self.logger.info("Staging load complete")
+
+        except Exception as e:
+            self.logger.error(f"Failed to write to staging data: {e}")
+            raise
+
+
+    def run_sql_pipeline(self) -> None:
+        """
+        Execute sql/load_pipeline.sql against PostgreSQL.
+ 
+        That script:
+          1. Populates dim_country  (INSERT … SELECT DISTINCT … ON CONFLICT)
+          2. Populates dim_indicator (INSERT … SELECT DISTINCT … ON CONFLICT)
+          3. Populates dim_time      (INSERT … SELECT DISTINCT … ON CONFLICT)
+          4. Loads fact_gdp_measurements from staging (ON CONFLICT DO UPDATE)
+          5. Truncates stg_gdp
+ 
+        Everything runs inside a single transaction so a failure rolls back
+        cleanly and leaves the star schema untouched.
+        """
+        sql_path = Path(__file__).parent.parent / "sql" / "load_pipeline.sql"
+
+        try:
+            self.logger.info("Reading SQL pipeline from: %s", sql_path)
+            sql = sql_path.read_text()
+
+            conn = self._get_pg_connection()
+            cursor = conn.cursor()
+
+            self.logger.info("Executing SQL pipeline (staging -> dims -> facts)...")
+            cursor.execute(sql)
+            conn.commit()
+
+            cursor.close()
+            conn.close()
+            self.logger.info("SQL pipeline executed successfully")
+
+        except Exception as e:
+            self.logger.error(f"SQL pipeline execution failed: {e}")
+            raise
+    
+
     def run(self) -> None:
         """Execute the complete pipeline"""
         try:
@@ -251,8 +360,12 @@ class WorldBankSparkJob:
             # Step 5: Write analytics data
             self.write_analytics_data(analytics_df)
 
-            cleaned_df.unpersist()
             analytics_df.unpersist()
+
+            self.write_to_staging(cleaned_df)
+            cleaned_df.unpersist()
+
+            self.run_sql_pipeline()
 
             self.logger.info("="*80)
             self.logger.info("Pipeline completed successfully")
