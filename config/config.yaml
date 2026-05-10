@@ -10,6 +10,14 @@ api:
   per_page: 1000
   format: "json"
 
+
+postgres:
+  host: "postgres"
+  port: 5432
+  database: ${POSTGRES_DATABASE}
+  user: ${POSTGRES_USER}
+  password: ${POSTGRES_PASSWORD}
+
 spark:
   app_name: "WorldBankPipeline"
   master: "local[*]"

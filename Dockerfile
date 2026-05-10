@@ -16,7 +16,9 @@ ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
 
 RUN mkdir -p $SPARK_HOME/jars && \
     curl -o $SPARK_HOME/jars/hadoop-aws-3.3.4.jar https://repo1.maven.org/maven2/org/apache/hadoop/hadoop-aws/3.3.4/hadoop-aws-3.3.4.jar && \
-    curl -o $SPARK_HOME/jars/aws-java-sdk-bundle-1.12.565.jar https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.565/aws-java-sdk-bundle-1.12.565.jar
+    curl -o $SPARK_HOME/jars/aws-java-sdk-bundle-1.12.565.jar https://repo1.maven.org/maven2/com/amazonaws/aws-java-sdk-bundle/1.12.565/aws-java-sdk-bundle-1.12.565.jar && \
+    curl -o $SPARK_HOME/jars/postgresql-42.7.1.jar https://jdbc.postgresql.org/download/postgresql-42.7.1.jar
+
 
 USER airflow
 
@@ -25,6 +27,7 @@ RUN pip install --no-cache-dir \
     pyspark==3.5.0 \
     boto3 \
     pyyaml \
-    requests
+    requests \
+    psycopg2-binary
 
 WORKDIR /home/airflow/
