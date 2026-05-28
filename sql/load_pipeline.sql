@@ -48,7 +48,9 @@ SELECT DISTINCT ON (year)
         WHEN year BETWEEN 1990 AND 1999 THEN '1990s'
         WHEN year BETWEEN 2000 AND 2009 THEN '2000s'
         WHEN year BETWEEN 2010 AND 2019 THEN '2010s'
-        ELSE '2020s'
+        WHEN year BETWEEN 2020 AND 2029 THEN '2020s'
+        -- Computed label for 2030 and beyond so no SQL change is needed per decade.
+        ELSE ((year / 10) * 10)::TEXT || 's'
     END AS era
 FROM stg_gdp
 WHERE year IS NOT NULL

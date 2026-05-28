@@ -36,7 +36,13 @@ def split_s3_path(s3_path: str) -> tuple[str, str]:
     return bucket, key
 
 
-def upload_to_s3(local_path: str, s3_key: str, bucket_name: str, logger: logging.Logger) -> bool:
+def upload_to_s3(
+    local_path: str,
+    s3_key: str,
+    bucket_name: str,
+    logger: logging.Logger,
+    region: str = None,
+) -> bool:
     """
     Upload a local file to an S3 bucket.
 
@@ -50,6 +56,9 @@ def upload_to_s3(local_path: str, s3_key: str, bucket_name: str, logger: logging
         Target S3 bucket name.
     logger : logging.Logger
         Logger instance for logging messages.
+    region : str, optional
+        AWS region name (e.g. "us-east-1"). When None, boto3 falls back to
+        the environment's default region (AWS_DEFAULT_REGION / ~/.aws/config).
 
     Returns
     -------
@@ -80,12 +89,13 @@ def upload_to_s3(local_path: str, s3_key: str, bucket_name: str, logger: logging
         logger.info(f"Starting upload: {local_path} ({file_size_mb: .2f} MB)")
         logger.info(f"Destination: s3://{bucket_name}/{s3_key}")
 
-        s3_client = boto3.client("s3")
+        s3_client = boto3.client("s3", region_name=region)
 
         s3_client.upload_file(
             Filename=str(local_file),
             Bucket=bucket_name,
-            Key=s3_key
+            Key=s3_key,
+            ExtraArgs={"ServerSideEncryption": "AES256"},
         )
 
         logger.info(f"Upload successful")
@@ -158,8 +168,9 @@ def upload_raw_data(config: dict) -> None:
     )
 
     bucket, key = split_s3_path(full_s3_path)
+    region = config.get("s3", {}).get("region")
 
-    upload_to_s3(local_path, key, bucket, logger)
+    upload_to_s3(local_path, key, bucket, logger, region=region)
 
     logger.info("Upload completed successfully")
 
