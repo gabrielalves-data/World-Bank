@@ -1,9 +1,31 @@
+import re
 import yaml
 import os
 import logging
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
+
+
+def _expand_env_vars(content: str) -> str:
+    """
+    Expand environment variable placeholders in a string.
+
+    Handles two forms:
+      ${VAR}          — replaced by os.environ["VAR"], or left as-is if unset
+      ${VAR:-default} — replaced by os.environ["VAR"] if set, otherwise "default"
+
+    os.path.expandvars only understands the first form; the second is standard
+    shell syntax used in docker-compose / .env files and must be handled here.
+    """
+    def _replace_with_default(match: re.Match) -> str:
+        return os.environ.get(match.group(1), match.group(2))
+
+    # Resolve ${VAR:-default} before expandvars touches the string
+    content = re.sub(r"\$\{(\w+):-([^}]*)\}", _replace_with_default, content)
+    # Resolve remaining ${VAR} and $VAR forms
+    return os.path.expandvars(content)
+
 
 def load_config(config_path: str = None) -> dict:
     """
@@ -45,7 +67,7 @@ def load_config(config_path: str = None) -> dict:
     with open(config_path, "r") as f:
         config_content = f.read()
 
-    config_content = os.path.expandvars(config_content)
+    config_content = _expand_env_vars(config_content)
     config = yaml.safe_load(config_content)
     logger.info(f"Config loaded from {config_path}")
 

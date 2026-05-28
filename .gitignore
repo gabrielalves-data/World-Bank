@@ -28,6 +28,9 @@ airflow.cfg
 .ipynb_checkpoints/
 *.ipynb
 
+# Claude Code (personal overrides only — settings.json is intentionally committed)
+.claude/settings.json
+
 # VS Code
 .vscode/
 

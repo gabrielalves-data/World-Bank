@@ -1,11 +1,12 @@
 s3:
   bucket: ${S3_BUCKET_NAME}
+  region: ${AWS_DEFAULT_REGION:-eu-west-1}
   raw_prefix: "raw/world_bank"
   processed_prefix: "processed/world_bank"
   analytics_prefix: "analytics/world_bank"
 
 api:
-  base_url: "http://api.worldbank.org/v2"
+  base_url: "https://api.worldbank.org/v2"
   indicator: "NY.GDP.MKTP.CD"
   per_page: 1000
   format: "json"
@@ -17,11 +18,17 @@ postgres:
   database: ${POSTGRES_DATABASE}
   user: ${POSTGRES_USER}
   password: ${POSTGRES_PASSWORD}
+  # "require" for production (RDS, Cloud SQL, etc.); "prefer" keeps local
+  # Docker working without a certificate. Set via env var POSTGRES_SSLMODE.
+  sslmode: ${POSTGRES_SSLMODE:-prefer}
 
 spark:
   app_name: "WorldBankPipeline"
   master: "local[*]"
   log_level: "WARN"
+  # Path to the PostgreSQL JDBC driver JAR on the Spark cluster.
+  # Update when upgrading driver or changing the Spark installation directory.
+  jdbc_driver_jar: "/opt/spark-3.5.0-bin-hadoop3/jars/postgresql-42.7.1.jar"
 
 logging:
   level: "INFO"

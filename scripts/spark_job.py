@@ -2,7 +2,6 @@ import logging
 import sys
 from typing import Dict, Any
 from pathlib import Path
-import yaml
 from pyspark.sql import SparkSession, DataFrame
 from pyspark.sql.functions import col, avg, count, countDistinct, max as spark_max, min as spark_min, sum as spark_sum, when
 from pyspark.sql.types import IntegerType, DoubleType
@@ -13,7 +12,7 @@ import json
 
 from utils.config_loader import load_config
 from utils.logging_config import setup_logging
-from scripts.s3_upload import get_s3_path
+from utils.config_loader import get_s3_path
 
 
 # Custom Exception
@@ -38,14 +37,17 @@ class DataQualityError(Exception):
         self.report = report
 
 
-# Conxtants
+# Constants
 
 GDP_MIN_SUSPICIOUS: float = 1_000_000           # USD 1 million
 GDP_MAX_SUSPICIOUS: float = 30_000_000_000_000  # USD 30 trillion
 NULL_RATE_THRESHOLD: float = 0.05               # 5 %
 ROW_DROP_THRESHOLD: float  = 0.20               # 20 %
 YEAR_MIN: int = 1960
-RUN_METADATA_PATH: str = os.path.join("logs", "run_metadata.json")
+# Absolute path so the file is always written to the project's logs/ directory,
+# regardless of the CWD when spark-submit launches the driver.
+_PROJECT_ROOT     = Path(__file__).parent.parent
+RUN_METADATA_PATH = str(_PROJECT_ROOT / "logs" / "run_metadata.json")
  
 # Severity constants
 CRITICAL = "CRITICAL"
@@ -96,13 +98,16 @@ class WorldBankSparkJob:
 
     def _postgres_props(self) -> dict:
         pg = self.config["postgres"]
+        sslmode = pg.get("sslmode", "prefer")
 
         return {
-            "user": pg["user"],
+            "user":     pg["user"],
             "password": pg["password"],
-            "driver": "org.postgresql.Driver"
+            "driver":   "org.postgresql.Driver",
+            "ssl":      "true" if sslmode != "disable" else "false",
+            "sslmode":  sslmode,
         }
-    
+
     def _get_pg_connection(self):
         """Return a psycopg2 connection using config values."""
         pg = self.config["postgres"]
@@ -111,7 +116,8 @@ class WorldBankSparkJob:
             port=pg.get("port", 5432),
             dbname=pg["database"],
             user=pg["user"],
-            password=pg["password"]
+            password=pg["password"],
+            sslmode=pg.get("sslmode", "prefer"),
         )
     
 
@@ -125,15 +131,16 @@ class WorldBankSparkJob:
             Configured SparkSession
         """
         try:
+            spark_cfg  = self.config.get("spark", {})
+            jdbc_jar   = spark_cfg.get("jdbc_driver_jar", "")
+
             spark = (SparkSession.builder
-                    .appName('WorldBankPipeline')
+                    .appName(spark_cfg.get("app_name", "WorldBankPipeline"))
                     .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem")
                     .config("spark.hadoop.fs.s3a.aws.credentials.provider",
                         "com.amazonaws.auth.DefaultAWSCredentialsProviderChain")
-                    .config("spark.driver.extraClassPath",
-                        "/opt/spark-3.5.0-bin-hadoop3/jars/postgresql-42.7.1.jar")
-                    .config("spark.executor.extraClassPath",
-                        "/opt/spark-3.5.0-bin-hadoop3/jars/postgresql-42.7.1.jar")
+                    .config("spark.driver.extraClassPath",   jdbc_jar)
+                    .config("spark.executor.extraClassPath", jdbc_jar)
                     .config("spark.sql.adaptive.enabled", "true")
                     .config("spark.sql.adaptive.coalescePartitions.enabled", "true")
                     .config("spark.hadoop.fs.s3a.multipart.size", "67108864")
@@ -142,6 +149,10 @@ class WorldBankSparkJob:
                     .config("spark.driver.memory", "2g")
                     .config("spark.executor.memory", "2g")
                     .config("spark.driver.maxResultSize", "1g")
+                    # FileOutputCommitter v2 — each task moves its output immediately
+                    # after completing, avoiding the bulk rename at job commit that
+                    # causes NoSuchKey errors on S3's non-atomic rename simulation
+                    .config("spark.hadoop.mapreduce.fileoutputcommitter.algorithm.version", "2")
                     .getOrCreate())
             
             self.logger.info("SparkSession created successfully")
@@ -174,7 +185,7 @@ class WorldBankSparkJob:
 
             row_count = df.count()
             self.logger.info(f"Successfully read {row_count:,} rows from raw data")
-            self.logger.info(f"Schema: {df.printSchema()}")
+            self.logger.info(f"Schema: {df.schema.simpleString()}")
 
             return df
         
@@ -195,25 +206,24 @@ class WorldBankSparkJob:
         try:
             self.logger.info('Starting data cleaning...')
 
-            # Select and rename columns with proper types
-            cleaned_df = df.select(
-                col('country.value').alias('country_name'),
-                col('country.id').alias('country_iso3'),
-                col('indicator.id').alias('indicator_id'),
-                col('date').cast(IntegerType()).alias('year'),
-                col('value').cast(DoubleType()).alias('gdp_usd')
+            # Select, rename, cast, and drop null GDP rows in one pass.
+            # Null-count detail is captured by validate_data_quality(); no need
+            # to trigger a second full scan here just for a log line.
+            cleaned_df = (
+                df.select(
+                    col('country.value').alias('country_name'),
+                    col('country.id').alias('country_iso3'),
+                    col('indicator.id').alias('indicator_id'),
+                    col('date').cast(IntegerType()).alias('year'),
+                    col('value').cast(DoubleType()).alias('gdp_usd')
+                )
+                .filter(col('gdp_usd').isNotNull())
             )
 
-            # Drop rows with null GDP values
-            cleaned_df = cleaned_df.filter(col('gdp_usd').isNotNull())
-
             row_count = cleaned_df.count()
-            null_count = df.count() - row_count
 
             self.logger.info("Data cleaning complete:")
-            self.logger.info(f"  - Rows after cleaning: {row_count:,}")
-            self.logger.info(f"  - Rows with null GDP removed: {null_count:,}")
-
+            self.logger.info(f"  - Rows retained (non-null gdp_usd): {row_count:,}")
             self.logger.info("Sample of cleaned data:")
             cleaned_df.show(5, truncate=False)
 
@@ -470,7 +480,7 @@ class WorldBankSparkJob:
             existing_meta['last_run_row_count'] = total_rows
             existing_meta['last_run_timestamp'] = datetime.now().isoformat()
             with open(RUN_METADATA_PATH, 'w') as fh:
-                json.dumps(existing_meta, fh, indent=2)
+                json.dump(existing_meta, fh, indent=2)
 
         except Exception as e:
             self.logger.warning(f"Could not persist run metadata: {e}")
@@ -489,7 +499,7 @@ class WorldBankSparkJob:
         out_of_range_rate = out_of_range_count / total_rows if total_rows > 0 else 0.0
         year_passed = out_of_range_count == 0
 
-        year_check = year_check = {
+        year_check = {
             "status": PASS if year_passed else FAIL,
             "severity": CRITICAL,
             "min_year_found": int(year_row["min_year"]) if year_row["min_year"] is not None else None,
@@ -539,7 +549,7 @@ class WorldBankSparkJob:
         if critical_failures:
             raise DataQualityError(
                 message=(
-                    f"Data quality validation FAILED"
+                    f"Data quality validation FAILED. "
                     f"Critical checks failed: {', '.join(critical_failures)}"
                 ),
                 failed_checks=critical_failures,
@@ -635,39 +645,38 @@ class WorldBankSparkJob:
 
     def write_to_staging(self, df: DataFrame) -> None:
         """
-        Truncate stg_gdp and bulk-load the cleaned DataFrame into it via JDBC.
- 
+        Bulk-load the cleaned DataFrame into stg_gdp via JDBC.
+
+        Uses SaveMode.Overwrite with truncate=true so the TRUNCATE and all
+        INSERTs are issued through the same JDBC session — eliminating the
+        two-connection race condition that would leave stg_gdp empty if a
+        separate psycopg2 TRUNCATE committed before a failing JDBC write.
+
         The staging table mirrors the cleaned DataFrame schema:
             country_name, country_iso3, indicator_id, year, gdp_usd
- 
+
         Parameters
         ----------
         df : DataFrame
             Cleaned DataFrame produced by clean_data().
         """
         try:
-            # Truncate before load so a re-run never leaves stale data
-            self.logger.info("Truncating stg_gdp...")
-            conn = self._get_pg_connection()
-            cursor = conn.cursor()
-            cursor.execute("TRUNCATE TABLE stg_gdp;")
-            conn.commit()
-            cursor.close()
-            conn.close()
-            self.logger.info("stg_gdp truncated successfully")
-
             row_count = df.count()
             self.logger.info(f"Writing {row_count:,} rows to stg_gdp...")
 
-            url = self._postgres_url()
-            props = {
-                "user": self.config["postgres"]["user"],
-                "password": self.config["postgres"]["password"],
-                "driver": "org.postgresql.Driver"
-            }
+            url   = self._postgres_url()
+            props = self._postgres_props()
 
-            # Bulk insert via JDBC
-            df.write.mode("append").option("batchsize", "5000").jdbc(url=url, table="stg_gdp", properties=props)
+            # mode("overwrite") + truncate=true: Spark issues TRUNCATE TABLE
+            # through the same JDBC connection before batching INSERTs.
+            # This preserves indexes/constraints (unlike DROP+CREATE) and
+            # avoids the committed-truncate / failed-write window.
+            df.write \
+                .mode("overwrite") \
+                .option("truncate", "true") \
+                .option("batchsize", "5000") \
+                .jdbc(url=url, table="stg_gdp", properties=props)
+
             self.logger.info("Staging load complete")
 
         except Exception as e:
@@ -696,14 +705,14 @@ class WorldBankSparkJob:
             sql = sql_path.read_text()
 
             conn = self._get_pg_connection()
-            cursor = conn.cursor()
-
-            self.logger.info("Executing SQL pipeline (staging -> dims -> facts)...")
-            cursor.execute(sql)
-            conn.commit()
-
-            cursor.close()
-            conn.close()
+            try:
+                cursor = conn.cursor()
+                self.logger.info("Executing SQL pipeline (staging -> dims -> facts)...")
+                cursor.execute(sql)
+                conn.commit()
+                cursor.close()
+            finally:
+                conn.close()
             self.logger.info("SQL pipeline executed successfully")
 
         except Exception as e:
@@ -723,22 +732,25 @@ class WorldBankSparkJob:
 
             # Step 2: Clean raw data
             cleaned_df = self.clean_data(raw_df)
-            cleaned_df.cache()
 
-            # Step 3: Data quality validation
+            # Step 3: Data quality validation (caches internally, then unpersists)
             dq_report = self.validate_data_quality(cleaned_df)
             self.logger.info(f"Data quality overall status: {dq_report['overall_status']}")
+
+            # Cache after validation so subsequent steps reuse the same data
+            cleaned_df.cache()
 
             # Step 4: Write processed/cleaned data
             self.write_processed_data(cleaned_df)
 
             # Step 5: Create analytics data
             analytics_df = self.create_analytics(cleaned_df)
-
-            # Step 6: Write analytics data
-            self.write_analytics_data(analytics_df)
-
-            analytics_df.unpersist()
+            # Guarantee unpersist even if the write step raises.
+            try:
+                # Step 6: Write analytics data
+                self.write_analytics_data(analytics_df)
+            finally:
+                analytics_df.unpersist()
 
             self.write_to_staging(cleaned_df)
             cleaned_df.unpersist()

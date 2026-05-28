@@ -1,31 +1,35 @@
 import logging
 
-# Logging Setup
 def setup_logging(config: dict) -> logging.Logger:
     """
-    Configure and initialize the application logger.
+    Configure and return the root logger.
+
+    Safe to call multiple times: adds a StreamHandler only when the root
+    logger has no handlers yet, preventing duplicate log lines while
+    ensuring every call correctly applies the configured level.
+    (logging.basicConfig() is a no-op after the first call in a process,
+    which caused the level/format to be silently ignored on re-invocation.)
 
     Parameters
     ----------
     config : dict
-        Configuration dictionary containing logging settings.
-        Must include:
-        - config["logging"]["level"] : str
-        - config["logging"]["format"] : str
+        Must include config["logging"]["level"] and config["logging"]["format"].
 
     Returns
     -------
     logging.Logger
-        Configured logger instance for the current module.
-
-    Notes
-    -----
-    The logging level is dynamically resolved using ``getattr(logging, level)``.
-    This function should be called once at the start of execution.
+        The configured root logger.
     """
-    logging.basicConfig(
-        level=getattr(logging, config["logging"]["level"]),
-        format=config["logging"]["format"]
-    )
+    level_name = config["logging"]["level"].upper()
+    log_level  = getattr(logging, level_name, logging.INFO)
+    log_format = config["logging"]["format"]
 
-    return logging.getLogger(__name__)
+    root = logging.getLogger()
+    root.setLevel(log_level)
+
+    if not root.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter(log_format))
+        root.addHandler(handler)
+
+    return root

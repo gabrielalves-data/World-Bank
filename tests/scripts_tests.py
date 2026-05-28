@@ -233,25 +233,6 @@ class TestCleanData:
     to build input DataFrames in the tests.
     """
 
-    # ------------------------------------------------------------------
-    # Raw-data schema that mimics the nested JSON from the World Bank API
-    # after Spark reads it (country / indicator are structs).
-    # ------------------------------------------------------------------
-    RAW_SCHEMA = StructType.fromJson({
-        "type": "struct",
-        "fields": [
-            {"name": "country",   "type": {"type": "struct", "fields": [
-                {"name": "id",    "type": "string", "nullable": True, "metadata": {}},
-                {"name": "value", "type": "string", "nullable": True, "metadata": {}},
-            ]}, "nullable": True, "metadata": {}},
-            {"name": "indicator", "type": {"type": "struct", "fields": [
-                {"name": "id",    "type": "string", "nullable": True, "metadata": {}},
-            ]}, "nullable": True, "metadata": {}},
-            {"name": "date",  "type": "string",  "nullable": True, "metadata": {}},
-            {"name": "value", "type": "string",  "nullable": True, "metadata": {}},
-        ]
-    })
-
     @pytest.fixture(autouse=True)
     def job(self, spark):
         """
@@ -391,3 +372,255 @@ class TestCleanData:
         result = job.clean_data(raw_df)
 
         assert result.count() == 3
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# WorldBankSparkJob.validate_data_quality() tests
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestValidateDataQuality:
+    """Tests for WorldBankSparkJob.validate_data_quality()."""
+
+    _CLEAN_SCHEMA = StructType([
+        StructField("country_name",  StringType(),  nullable=True),
+        StructField("country_iso3",  StringType(),  nullable=True),
+        StructField("indicator_id",  StringType(),  nullable=True),
+        StructField("year",          IntegerType(), nullable=True),
+        StructField("gdp_usd",       DoubleType(),  nullable=True),
+    ])
+
+    @pytest.fixture(autouse=True)
+    def job(self, spark):
+        from scripts.spark_job import WorldBankSparkJob
+        instance = object.__new__(WorldBankSparkJob)
+        instance.logger = logging.getLogger("test_dq")
+        instance.spark  = spark
+        return instance
+
+    def _make_clean_df(self, spark, rows: list):
+        from pyspark.sql import Row
+        pyspark_rows = [
+            Row(
+                country_name=r["country_name"],
+                country_iso3=r["country_iso3"],
+                indicator_id=r["indicator_id"],
+                year=r["year"],
+                gdp_usd=r["gdp_usd"],
+            )
+            for r in rows
+        ]
+        return spark.createDataFrame(pyspark_rows, schema=self._CLEAN_SCHEMA)
+
+    def _good_row(self, iso3="US", year=2022, gdp=25e12):
+        return {
+            "country_name": "Test Country",
+            "country_iso3": iso3,
+            "indicator_id": "NY.GDP.MKTP.CD",
+            "year": year,
+            "gdp_usd": gdp,
+        }
+
+    def test_all_checks_pass_on_clean_data(self, job, spark):
+        """A DataFrame with no issues should return overall_status PASS."""
+        df = self._make_clean_df(spark, [self._good_row()])
+        report = job.validate_data_quality(df, prev_run_count=None)
+        assert report["overall_status"] == "PASS"
+
+    def test_report_contains_required_keys(self, job, spark):
+        """Report must always contain timestamp, total_rows, checks, overall_status."""
+        df = self._make_clean_df(spark, [self._good_row()])
+        report = job.validate_data_quality(df, prev_run_count=None)
+        for key in ("timestamp", "total_rows", "checks", "overall_status"):
+            assert key in report, f"Missing key: {key}"
+
+    def test_year_out_of_range_raises_data_quality_error(self, job, spark):
+        """A row with year=1800 (< YEAR_MIN=1960) should raise DataQualityError."""
+        from scripts.spark_job import DataQualityError
+        df = self._make_clean_df(spark, [self._good_row(year=1800)])
+        with pytest.raises(DataQualityError) as exc_info:
+            job.validate_data_quality(df, prev_run_count=None)
+        assert "year_range" in exc_info.value.failed_checks
+
+    def test_future_year_raises_data_quality_error(self, job, spark):
+        """A row with year far in the future should fail the year range check."""
+        from scripts.spark_job import DataQualityError
+        df = self._make_clean_df(spark, [self._good_row(year=9999)])
+        with pytest.raises(DataQualityError) as exc_info:
+            job.validate_data_quality(df, prev_run_count=None)
+        assert "year_range" in exc_info.value.failed_checks
+
+    def test_suspicious_gdp_below_min_sets_warn(self, job, spark):
+        """GDP below $1M should set gdp_value_range check to WARN (not FAIL)."""
+        df = self._make_clean_df(spark, [self._good_row(gdp=500.0)])
+        report = job.validate_data_quality(df, prev_run_count=None)
+        assert report["checks"]["gdp_value_range"]["status"] == "WARN"
+
+    def test_row_count_drop_beyond_threshold_sets_warn(self, job, spark):
+        """A >20% row drop compared to prev_run_count should set row check to WARN."""
+        df = self._make_clean_df(spark, [self._good_row()])
+        report = job.validate_data_quality(df, prev_run_count=100)
+        assert report["checks"]["row_count_comparison"]["status"] == "WARN"
+
+    def test_row_count_check_skipped_when_no_previous_run(self, job, spark):
+        """When prev_run_count is None and no metadata file exists, check is SKIP."""
+        df = self._make_clean_df(spark, [self._good_row()])
+        report = job.validate_data_quality(df, prev_run_count=None)
+        assert report["checks"]["row_count_comparison"]["status"] in ("SKIP", "PASS", "WARN")
+
+    def test_duplicates_detected(self, job, spark):
+        """Duplicate (country_iso3, year) pairs should trigger a WARN."""
+        rows = [self._good_row(iso3="US", year=2022), self._good_row(iso3="US", year=2022)]
+        df = self._make_clean_df(spark, rows)
+        report = job.validate_data_quality(df, prev_run_count=None)
+        assert report["checks"]["duplicates"]["status"] == "WARN"
+
+    def test_overall_status_warn_when_only_warnings(self, job, spark):
+        """Only WARNING-level issues should set overall_status to WARN, not FAIL."""
+        rows = [self._good_row(iso3="US", year=2022), self._good_row(iso3="US", year=2022)]
+        df = self._make_clean_df(spark, rows)
+        report = job.validate_data_quality(df, prev_run_count=None)
+        assert report["overall_status"] == "WARN"
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# s3_upload: split_s3_path() and upload_to_s3() tests
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestSplitS3Path:
+
+    def test_valid_s3_path_splits_correctly(self):
+        bucket, key = __import__("scripts.s3_upload", fromlist=["split_s3_path"]).split_s3_path(
+            "s3://my-bucket/path/to/file.json"
+        )
+        assert bucket == "my-bucket"
+        assert key    == "path/to/file.json"
+
+    def test_invalid_path_raises_value_error(self):
+        from scripts.s3_upload import split_s3_path
+        with pytest.raises(ValueError, match="Invalid S3 path"):
+            split_s3_path("https://my-bucket/path/file.json")
+
+    def test_bucket_only_path(self):
+        from scripts.s3_upload import split_s3_path
+        bucket, key = split_s3_path("s3://my-bucket/file.json")
+        assert bucket == "my-bucket"
+        assert key    == "file.json"
+
+
+class TestUploadToS3:
+
+    def test_missing_local_file_raises_file_not_found(self, tmp_path):
+        from scripts.s3_upload import upload_to_s3
+        logger = logging.getLogger("test_s3")
+        with pytest.raises(FileNotFoundError):
+            upload_to_s3(str(tmp_path / "nonexistent.json"), "key", "bucket", logger)
+
+    def test_successful_upload_returns_true(self, tmp_path):
+        from scripts.s3_upload import upload_to_s3
+        local_file = tmp_path / "data.json"
+        local_file.write_text('{"test": 1}')
+        logger = logging.getLogger("test_s3")
+
+        with patch("scripts.s3_upload.boto3.client") as mock_boto:
+            mock_s3 = MagicMock()
+            mock_boto.return_value = mock_s3
+
+            result = upload_to_s3(str(local_file), "path/data.json", "my-bucket", logger)
+
+        assert result is True
+        mock_s3.upload_file.assert_called_once()
+
+    def test_upload_uses_aes256_server_side_encryption(self, tmp_path):
+        """The upload call must always pass AES256 SSE via ExtraArgs."""
+        from scripts.s3_upload import upload_to_s3
+        local_file = tmp_path / "data.json"
+        local_file.write_text("{}")
+        logger = logging.getLogger("test_s3")
+
+        with patch("scripts.s3_upload.boto3.client") as mock_boto:
+            mock_s3 = MagicMock()
+            mock_boto.return_value = mock_s3
+            upload_to_s3(str(local_file), "k", "b", logger)
+
+        call_kwargs = mock_s3.upload_file.call_args[1]
+        assert call_kwargs.get("ExtraArgs", {}).get("ServerSideEncryption") == "AES256"
+
+    def test_no_credentials_error_propagates(self, tmp_path):
+        from scripts.s3_upload import upload_to_s3
+        from botocore.exceptions import NoCredentialsError
+        local_file = tmp_path / "data.json"
+        local_file.write_text("{}")
+        logger = logging.getLogger("test_s3")
+
+        with patch("scripts.s3_upload.boto3.client") as mock_boto:
+            mock_boto.return_value.upload_file.side_effect = NoCredentialsError()
+            with pytest.raises(NoCredentialsError):
+                upload_to_s3(str(local_file), "k", "b", logger)
+
+    def test_region_passed_to_boto3_client(self, tmp_path):
+        """region kwarg must be forwarded to boto3.client as region_name."""
+        from scripts.s3_upload import upload_to_s3
+        local_file = tmp_path / "data.json"
+        local_file.write_text("{}")
+        logger = logging.getLogger("test_s3")
+
+        with patch("scripts.s3_upload.boto3.client") as mock_boto:
+            mock_boto.return_value = MagicMock()
+            upload_to_s3(str(local_file), "k", "b", logger, region="eu-west-1")
+
+        mock_boto.assert_called_once_with("s3", region_name="eu-west-1")
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# config_loader: load_config() error paths
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TestLoadConfig:
+
+    def test_raises_file_not_found_for_missing_path(self, tmp_path):
+        from utils.config_loader import load_config
+        with pytest.raises(FileNotFoundError):
+            load_config(str(tmp_path / "does_not_exist.yaml"))
+
+    def test_valid_yaml_is_parsed(self, tmp_path):
+        from utils.config_loader import load_config
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text("api:\n  base_url: 'http://example.com'\n")
+        config = load_config(str(cfg_file))
+        assert config["api"]["base_url"] == "http://example.com"
+
+    def test_env_var_substitution_applied(self, tmp_path, monkeypatch):
+        """${VAR} placeholders in YAML must be expanded from the environment."""
+        from utils.config_loader import load_config
+        monkeypatch.setenv("TEST_BUCKET", "my-test-bucket")
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text("s3:\n  bucket: ${TEST_BUCKET}\n")
+        config = load_config(str(cfg_file))
+        assert config["s3"]["bucket"] == "my-test-bucket"
+
+    def test_missing_env_var_without_default_leaves_placeholder(self, tmp_path, monkeypatch):
+        """An unset ${VAR} (no default) is left as-is by os.path.expandvars."""
+        from utils.config_loader import load_config
+        monkeypatch.delenv("TOTALLY_ABSENT_VAR", raising=False)
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text("s3:\n  bucket: ${TOTALLY_ABSENT_VAR}\n")
+        config = load_config(str(cfg_file))
+        assert "${TOTALLY_ABSENT_VAR}" in str(config["s3"]["bucket"])
+
+    def test_missing_env_var_with_default_uses_default(self, tmp_path, monkeypatch):
+        """An unset ${VAR:-default} must resolve to the inline default value."""
+        from utils.config_loader import load_config
+        monkeypatch.delenv("ABSENT_REGION", raising=False)
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text("s3:\n  region: ${ABSENT_REGION:-eu-west-1}\n")
+        config = load_config(str(cfg_file))
+        assert config["s3"]["region"] == "eu-west-1"
+
+    def test_set_env_var_overrides_default(self, tmp_path, monkeypatch):
+        """When the env var IS set, it must take precedence over the inline default."""
+        from utils.config_loader import load_config
+        monkeypatch.setenv("MY_REGION", "ap-southeast-1")
+        cfg_file = tmp_path / "config.yaml"
+        cfg_file.write_text("s3:\n  region: ${MY_REGION:-us-east-1}\n")
+        config = load_config(str(cfg_file))
+        assert config["s3"]["region"] == "ap-southeast-1"
