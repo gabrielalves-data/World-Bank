@@ -3,10 +3,32 @@ import json
 import logging
 import os
 from datetime import date
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
 from utils.config_loader import load_config
 from utils.logging_config import setup_logging
 
+
+def _is_retryable(exc: BaseException) -> bool:
+    """
+    Retry on transient failures only:
+      - ConnectionError / Timeout (network issues)
+      - HTTPError with a 5xx status (server-side, likely temporary)
+    4xx errors (bad request, not found) are not retried.
+    """
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+        return True
+    if isinstance(exc, requests.HTTPError):
+        return exc.response is not None and exc.response.status_code >= 500
+    return False
+
+
 # API Call (single page)
+@retry(
+    retry=retry_if_exception(_is_retryable),
+    wait=wait_exponential(multiplier=1, min=2, max=30),
+    stop=stop_after_attempt(3),
+    reraise=True,
+)
 def fetch_page(base_url: str, indicator: str, page: int, per_page: int, fmt: str) -> tuple:
     """
     Fetch a single page of data from the World Bank API.
@@ -53,8 +75,16 @@ def fetch_page(base_url: str, indicator: str, page: int, per_page: int, fmt: str
 
     data = response.json()
 
+    if not isinstance(data, list) or len(data) < 2:
+        raise ValueError(
+            f"Unexpected World Bank API response format: expected a 2-element "
+            f"list [metadata, records], got {type(data).__name__} with "
+            f"{len(data) if isinstance(data, list) else 'N/A'} element(s). "
+            f"URL: {url}"
+        )
+
     metadata = data[0]
-    records = data[1] if data[1] is not None else []
+    records  = data[1] if data[1] is not None else []
 
     return metadata, records
 

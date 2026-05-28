@@ -1,8 +1,5 @@
--- Create analytics database (if not already exists)
-CREATE DATABASE IF NOT EXISTS analytics;
-
--- Connect to analytics database
-\c analytics;
+-- Connect to the target database before running this script:
+--   psql -U <user> -d <database> -f init_postgres.sql
 
 
 -- Staging Table
@@ -13,6 +10,11 @@ CREATE TABLE IF NOT EXISTS stg_gdp (
     year INT,
     gdp_usd DOUBLE PRECISION
 );
+
+-- Composite index to speed up the GROUP BY in the deduped CTE and the
+-- EXISTS checks against dim_country / dim_time / dim_indicator.
+CREATE INDEX IF NOT EXISTS idx_stg_gdp_key
+    ON stg_gdp (country_iso3, year, indicator_id);
 
 
 -- Dimension: country
