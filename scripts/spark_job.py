@@ -4,14 +4,58 @@ from typing import Dict, Any
 from pathlib import Path
 import yaml
 from pyspark.sql import SparkSession, DataFrame
-from pyspark.sql.functions import col, avg, count
+from pyspark.sql.functions import col, avg, count, countDistinct, max as spark_max, min as spark_min, sum as spark_sum, when
 from pyspark.sql.types import IntegerType, DoubleType
 from datetime import datetime
 import psycopg2
+import os
+import json
 
 from utils.config_loader import load_config
 from utils.logging_config import setup_logging
 from scripts.s3_upload import get_s3_path
+
+
+# Custom Exception
+
+class DataQualityError(Exception):
+    """
+    Raised when one or more critical data quality checks fail.
+ 
+    Attributes
+    ----------
+    message : str
+        Human-readable description of which checks failed.
+    failed_checks : list[str]
+        Names of the checks that triggered the failure.
+    report : dict
+        Full data quality report at the time of failure.
+    """
+
+    def __init__(self, message: str, failed_checks: list, report: dict):
+        super().__init__(message)
+        self.failed_checks = failed_checks
+        self.report = report
+
+
+# Conxtants
+
+GDP_MIN_SUSPICIOUS: float = 1_000_000           # USD 1 million
+GDP_MAX_SUSPICIOUS: float = 30_000_000_000_000  # USD 30 trillion
+NULL_RATE_THRESHOLD: float = 0.05               # 5 %
+ROW_DROP_THRESHOLD: float  = 0.20               # 20 %
+YEAR_MIN: int = 1960
+RUN_METADATA_PATH: str = os.path.join("logs", "run_metadata.json")
+ 
+# Severity constants
+CRITICAL = "CRITICAL"
+WARNING  = "WARNING"
+ 
+# Status constants
+PASS = "PASS"
+FAIL = "FAIL"
+WARN = "WARN"
+SKIP = "SKIP"
 
 
 class WorldBankSparkJob:
@@ -28,6 +72,8 @@ class WorldBankSparkJob:
         self.config = load_config(config_path)
         self.logger = setup_logging(self.config)
         self.spark = self.create_spark_session()
+
+    # Helpers
 
     @staticmethod
     def convert_to_s3a(s3_path: str) -> str:
@@ -69,6 +115,8 @@ class WorldBankSparkJob:
         )
     
 
+    # Spark Session
+
     def create_spark_session(self) -> SparkSession:
         """
         Create and configure Spark session for S3 access.
@@ -103,6 +151,8 @@ class WorldBankSparkJob:
         except Exception as e:
             self.logger.error(f"Failed to create SparkSession: {e}")
             raise
+
+    # Extract / Transform
 
     def read_raw_data(self) -> DataFrame:
         """
@@ -172,6 +222,331 @@ class WorldBankSparkJob:
         except Exception as e:
             self.logger.error(f"Failed to clean data: {e}")
             raise
+
+    # Data Quality Validation
+
+    def validate_data_quality(self, df: DataFrame, prev_run_count: int = None) -> Dict[str, Any]:
+        """
+        Run a suite of data quality checks on the cleaned DataFrame and return
+        a structured report.
+ 
+        Checks
+        ------
+        1. **Null counts per column** (CRITICAL)
+           Fails if the ``gdp_usd`` null rate exceeds 5 %.
+        2. **GDP value range** (WARNING)
+           Flags values below $1 M or above $30 T as suspicious.
+        3. **Duplicate detection** (WARNING)
+           Detects duplicate ``(country_iso3, year)`` combinations.
+        4. **Row count vs previous run** (WARNING)
+           Warns if the total row count drops by more than 20 % compared with
+           the previous run (persisted in ``logs/run_metadata.json``).
+        5. **Year range validation** (CRITICAL)
+           Fails if any row contains a year outside [1960, current year].
+ 
+        Parameters
+        ----------
+        df : DataFrame
+            Cleaned DataFrame produced by :meth:`clean_data`.
+        prev_run_count : int, optional
+            Override the persisted previous run count for comparison.
+            When ``None`` the value is read from ``logs/run_metadata.json``.
+ 
+        Returns
+        -------
+        dict
+            Data quality report with the following top-level keys:
+ 
+            * ``timestamp``      - ISO-8601 string of when validation ran.
+            * ``total_rows``     - Row count of the validated DataFrame.
+            * ``checks``         - Dict of individual check results (see below).
+            * ``overall_status`` - ``"PASS"``, ``"WARN"``, or ``"FAIL"``.
+ 
+            Each check result contains at minimum:
+ 
+            * ``status``   - ``"PASS"`` | ``"WARN"`` | ``"FAIL"`` | ``"SKIP"``
+            * ``severity`` - ``"CRITICAL"`` | ``"WARNING"``
+            * ``message``  - Human-readable summary.
+ 
+        Raises
+        ------
+        DataQualityError
+            If any CRITICAL check fails (null rate or year range).
+ 
+        Notes
+        -----
+        * All Spark aggregations that can be batched are combined into a single
+          ``.agg()`` call to minimise shuffles and Spark actions.
+        * The DataFrame is cached at the start and unpersisted before returning.
+        * The current run's row count is always written back to
+          ``logs/run_metadata.json`` for the next run's comparison.
+        """
+
+        self.logger.info("=" * 60)
+        self.logger.info("Running Data Quality Validation")
+        self.logger.info("=" * 60)
+
+        current_year = datetime.now().year
+
+        report: Dict[str, Any] = {
+            "timestamp": datetime.now().isoformat(),
+            "total_rows": 0,
+            "checks": {},
+            "overall_status": "PASS"
+        }
+
+        critical_failures: list = []
+
+        # Cache df so all checks use the same in-memory copy
+        df.cache()
+        total_rows = df.count()
+        report["total_rows"] = total_rows
+
+        self.logger.info(f"Total rows to validate: {total_rows:,}")
+
+        # Check Null counts per column
+        columns = ["country_name", "country_iso3", "indicator_id", "year", "gdp_usd"]
+
+        null_agg_exprs = [
+            spark_sum(when(col(c).isNull(), 1).otherwise(0)).alias(f"null_{c}") for c in columns
+        ]
+        null_row = df.agg(*null_agg_exprs).collect()[0]
+        null_counts = {c: int(null_row[f"null_{c}"]) for c in columns}
+
+        gdp_null_count = null_counts['gdp_usd']
+        gdp_null_rate = gdp_null_count / total_rows if total_rows > 0 else 0.0
+        null_passed = gdp_null_rate <= NULL_RATE_THRESHOLD
+
+        null_check = {
+            "status": PASS if null_passed else FAIL,
+            "severity": CRITICAL,
+            "null_counts": null_counts,
+            "null_rates": {c: round(null_counts[c] / total_rows, 6) if total_rows > 0 else 0.0 for c in columns},
+            "gdp_usd_null_rate": round(gdp_null_rate, 6),
+            "threshold": NULL_RATE_THRESHOLD,
+            "message": (
+                f"gdp_usd null rate {gdp_null_rate:.2%} is within the "
+                f"{NULL_RATE_THRESHOLD:.0%} threshold"
+                if null_passed else
+                f"CRITICAL: gdp_usd null rate {gdp_null_rate:.2%} exceeds "
+                f"the {NULL_RATE_THRESHOLD:.0%} threshold "
+                f"({gdp_null_count:,} of {total_rows:,} rows)"
+            )
+        }
+
+        report["checks"]["null_counts"] = null_check
+        self.logger.info(f"[NULL CHECK] {null_check['message']}")
+        for col_name, cnt in null_counts.items():
+            rate = cnt / total_rows if total_rows > 0 else 0.0
+            self.logger.info(f"{col_name:<20} {cnt:>8,} nulls ({rate:.2%})")
+        
+        if not null_passed:
+            critical_failures.append("null_counts")
+
+        # Check GDP values range
+        range_row = df.agg(
+            spark_min(when(col("gdp_usd").isNotNull(), col("gdp_usd"))).alias("min_gdp"),
+            spark_max(when(col("gdp_usd").isNotNull(), col("gdp_usd"))).alias("max_gdp"),
+            spark_sum(
+                when(col("gdp_usd").isNotNull() & (col("gdp_usd") < GDP_MIN_SUSPICIOUS), 1)
+                .otherwise(0)
+            ).alias("below_min"),
+            spark_sum(
+                when(col("gdp_usd").isNotNull() & (col("gdp_usd") > GDP_MAX_SUSPICIOUS), 1)
+                .otherwise(0)
+            ).alias("above_max"),
+            spark_sum(when(col("gdp_usd").isNotNull(), 1).otherwise(0)).alias("non_null_count")
+        ).collect()[0]
+
+        below_min = int(range_row["below_min"])
+        above_max = int(range_row["above_max"])
+        suspicious = below_min + above_max
+        non_null_count = int(range_row["non_null_count"])
+        suspicious_rate = suspicious / non_null_count if non_null_count > 0 else 0.0
+        range_passed = suspicious == 0
+
+        range_check = {
+            "status": PASS if range_passed else WARN,
+            "severity": WARNING,
+            "min_gdp_usd": float(range_row["min_gdp"]) if range_row["min_gdp"] is not None else None,
+            "max_gdp_usd": float(range_row["max_gdp"]) if range_row["max_gdp"] is not None else None,
+            "suspicious_below_1m": below_min,
+            "suspicious_above_30t": above_max,
+            "suspicious_total": suspicious,
+            "suspicious_rate": round(suspicious_rate, 6),
+            "thresholds": {"min_usd": GDP_MIN_SUSPICIOUS, "max_usd": GDP_MAX_SUSPICIOUS},
+            "message": (
+                "All GDP values are within the expected range"
+                if range_passed else
+                f"WARNING: {suspicious:,} suspicious GDP values detected — "
+                f"{below_min:,} below $1 M, {above_max:,} above $30 T "
+                f"({suspicious_rate:.2%} of non-null rows)"
+            )
+        }
+        report["checks"]["gdp_value_range"] = range_check
+        self.logger.info(f"[GDP RANGE] {range_check['message']}")
+        if range_row['min_gdp'] is not None:
+            self.logger.info(f"Min GDP: ${range_row['min_gdp']:>20,.2f} | Max GDP: ${range_row['max_gdp']:>20,.2f}")
+
+        # Check Duplicate (country_iso3, year) combinations
+
+        keyed_df = df.filter(col("country_iso3").isNotNull() & col("year").isNotNull())
+        total_keyed = keyed_df.count()
+        distinct_keys = keyed_df.select("country_iso3", "year").distinct().count()
+        duplicate_count = total_keyed - distinct_keys
+        duplicate_rate = duplicate_count / total_keyed if total_keyed > 0 else 0.0
+        dup_passed = duplicate_count == 0
+
+        dup_check = {
+            "status":          PASS if dup_passed else WARN,
+            "severity":        WARNING,
+            "total_key_rows":  total_keyed,
+            "distinct_keys":   distinct_keys,
+            "duplicate_count": duplicate_count,
+            "duplicate_rate":  round(duplicate_rate, 6),
+            "message": (
+                "No duplicate (country_iso3, year) combinations found"
+                if dup_passed else
+                f"WARNING: {duplicate_count:,} duplicate (country_iso3, year) "
+                f"rows detected ({duplicate_rate:.2%} of keyed rows)"
+            )
+        }
+        report["checks"]["duplicates"] = dup_check
+        self.logger.info(f"[DUPLICATES]{dup_check['message']}")
+
+        # Check Row Count vs Previous Run
+        resolved_prev = prev_run_count
+        if resolved_prev is None:
+            try:
+                if os.path.exists(RUN_METADATA_PATH):
+                    with open(RUN_METADATA_PATH, 'r') as fh:
+                        meta = json.load(fh)
+                        resolved_prev = meta.get("last_run_row_count")
+
+            except Exception as e:
+                self.logger.warning(f"Could not read previous run metadata: {e}")
+
+        if resolved_prev is not None and resolved_prev > 0:
+            row_delta = resolved_prev - total_rows
+            row_drop_rate = row_delta / resolved_prev
+            row_count_passed = row_drop_rate <= ROW_DROP_THRESHOLD
+            row_count_check = {
+                "status": PASS if row_count_passed else WARN,
+                "severity": WARNING,
+                "current_count": total_rows,
+                "previous_count": resolved_prev,
+                "row_delta": row_delta,
+                "row_drop_rate": round(row_drop_rate, 6),
+                "threshold": ROW_DROP_THRESHOLD,
+                "message": (
+                    f"Row count change within threshold — "
+                    f"prev: {resolved_prev:,}  curr: {total_rows:,}  "
+                    f"delta: {row_delta:+,} ({row_drop_rate:+.2%})"
+                    if row_count_passed else
+                    f"WARNING: Row count dropped {row_drop_rate:.2%} "
+                    f"(from {resolved_prev:,} to {total_rows:,}); "
+                    f"threshold is {ROW_DROP_THRESHOLD:.0%}"
+                )
+            }
+        else:
+            row_count_check = {
+                "status": SKIP,
+                "severity": WARNING,
+                "current_count": total_rows,
+                "previous_count": None,
+                "message": "No previous run data found - skipping row count comparison."
+            }
+
+        report["checks"]["row_count_comparison"] = row_count_check
+        self.logger.info(f"[ROW COUNT] {row_count_check['message']}")
+
+        # Persist current run count for the next execution
+        try:
+            os.makedirs("logs", exist_ok=True)
+            existing_meta: dict = {}
+            if os.path.exists(RUN_METADATA_PATH):
+                with open(RUN_METADATA_PATH, 'r') as fh:
+                    existing_meta = json.load(fh)
+            existing_meta['last_run_row_count'] = total_rows
+            existing_meta['last_run_timestamp'] = datetime.now().isoformat()
+            with open(RUN_METADATA_PATH, 'w') as fh:
+                json.dumps(existing_meta, fh, indent=2)
+
+        except Exception as e:
+            self.logger.warning(f"Could not persist run metadata: {e}")
+
+
+        # Check year range validation
+        year_row = df.filter(col('year').isNotNull()).agg(
+            spark_min('year').alias('min_year'),
+            spark_max('year').alias('max_year'),
+            spark_sum(
+                when((col('year') < YEAR_MIN) | (col('year') > current_year), 1).otherwise(0)
+            ).alias('out_of_range')
+        ).collect()[0]
+
+        out_of_range_count = int(year_row['out_of_range'])
+        out_of_range_rate = out_of_range_count / total_rows if total_rows > 0 else 0.0
+        year_passed = out_of_range_count == 0
+
+        year_check = year_check = {
+            "status": PASS if year_passed else FAIL,
+            "severity": CRITICAL,
+            "min_year_found": int(year_row["min_year"]) if year_row["min_year"] is not None else None,
+            "max_year_found": int(year_row["max_year"]) if year_row["max_year"] is not None else None,
+            "valid_range": [YEAR_MIN, current_year],
+            "out_of_range_count": out_of_range_count,
+            "out_of_range_rate": round(out_of_range_rate, 6),
+            "message": (
+                f"All years are within the valid range [{YEAR_MIN}–{current_year}]"
+                if year_passed else
+                f"CRITICAL: {out_of_range_count:,} rows ({out_of_range_rate:.2%}) "
+                f"contain a year outside [{YEAR_MIN}–{current_year}]"
+            ),
+        }
+
+        report["checks"]['year_range'] = year_check
+        self.logger.info(f"[YEAR RANGE] {year_check['message']}")
+        if year_row['min_year'] is not None:
+            self.logger.info(f"Year range found: {year_row['min_year']} - {year_row['max_year']}")
+        
+        if not year_passed:
+            critical_failures.append("year_range")
+
+
+        # Summary
+
+        has_warnings = any(c['status'] == WARN for c in report['checks'].values())
+
+        if critical_failures:
+            report['overall_status'] = FAIL
+        elif has_warnings:
+            report["overall_status"] = WARN
+
+        _icons = {PASS: "✓", WARN: "⚠", FAIL: "✗", SKIP: "-"}
+        self.logger.info("-" * 60)
+        self.logger.info("DATA QUALITY REPORT SUMMARY")
+        self.logger.info('-' * 60)
+        for check_name, check_result in report["checks"].items():
+            icon = _icons.get(check_result['status'], '?')
+            self.logger.info(f" {icon}  {check_name:<26}    [{check_result['status']:<4}]   severity={check_result['severity']}")
+        
+        self.logger.info(f"OVERALL STATUS: {report['overall_status']}")
+        self.logger.info('-' * 60)
+
+        df.unpersist()
+
+        if critical_failures:
+            raise DataQualityError(
+                message=(
+                    f"Data quality validation FAILED"
+                    f"Critical checks failed: {', '.join(critical_failures)}"
+                ),
+                failed_checks=critical_failures,
+                report=report
+            )
+        
+        return report
 
 
     def write_processed_data(self, df: DataFrame) -> None:
@@ -348,16 +723,19 @@ class WorldBankSparkJob:
 
             # Step 2: Clean raw data
             cleaned_df = self.clean_data(raw_df)
-
             cleaned_df.cache()
 
-            # Step 3: Write processed/cleaned data
+            # Step 3: Data quality validation
+            dq_report = self.validate_data_quality(cleaned_df)
+            self.logger.info(f"Data quality overall status: {dq_report['overall_status']}")
+
+            # Step 4: Write processed/cleaned data
             self.write_processed_data(cleaned_df)
 
-            # Step 4: Create analytics data
+            # Step 5: Create analytics data
             analytics_df = self.create_analytics(cleaned_df)
 
-            # Step 5: Write analytics data
+            # Step 6: Write analytics data
             self.write_analytics_data(analytics_df)
 
             analytics_df.unpersist()
@@ -370,6 +748,11 @@ class WorldBankSparkJob:
             self.logger.info("="*80)
             self.logger.info("Pipeline completed successfully")
             self.logger.info("="*80)
+
+        except DataQualityError as dqe:
+            self.logger.error(f"Pipeline aborted - data quality failure {dqe}")
+            self.logger.error(f"Failed checks: {dqe.failed_checks}")
+            raise
 
         except Exception as e:
             self.logger.error(f"Pipeline failed: {e}")
