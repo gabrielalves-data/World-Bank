@@ -186,8 +186,8 @@ Minimum Docker resources recommended: **4 GB RAM**, **2 CPUs**, **10 GB disk**.
 ### 1. Clone and configure environment
 
 ```bash
-git clone <repo-url>
-cd "World Bank"
+git clone https://github.com/gabrielalves-data/World-Bank.git
+cd World-Bank
 cp .env.example .env
 ```
 
